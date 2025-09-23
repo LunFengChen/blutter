@@ -11,21 +11,57 @@ from elftools.elf.elffile import ELFFile
 from elftools.elf.enums import ENUM_E_MACHINE 
 from elftools.elf.sections import SymbolTableSection
 
+from loguru import logger
+
 # TODO: support both ELF and Mach-O file
 def extract_snapshot_hash_flags(libapp_file):
     with open(libapp_file, 'rb') as f:
         elf = ELFFile(f)
         # find "_kDartVmSnapshotData" symbol
+        
+        # 1. 优先用 .dynsym 查找
         dynsym = elf.get_section_by_name('.dynsym')
-        sym = dynsym.get_symbol_by_name('_kDartVmSnapshotData')[0]
-        #section = elf.get_section(sym['st_shndx'])
-        assert sym['st_size'] > 128
-        f.seek(sym['st_value']+20)
-        snapshot_hash = f.read(32).decode()
-        data = f.read(256) # should be enough
-        flags = data[:data.index(b'\0')].decode().strip().split(' ')
-    
-    return snapshot_hash, flags
+        if dynsym:
+            try:
+                sym_list = dynsym.get_symbol_by_name('_kDartVmSnapshotData')
+                if sym_list:
+                    sym = sym_list[0]
+                    assert sym['st_size'] > 128
+                    f.seek(sym['st_value']+20)
+                    snapshot_hash = f.read(32).decode()
+                    data = f.read(256) # should be enough
+                    flags = data[:data.index(b'\0')].decode().strip().split(' ')
+                    logger.info("Found snapshot hash and flags via .dynsym")
+                    return snapshot_hash, flags
+            except Exception as e:
+                logger.warning(f"Failed to extract via .dynsym: {e}")
+                
+        # 2. 如果没有 .dynsym 或找不到符号，尝试在 .rodata 里用特征匹配
+        rodata = elf.get_section_by_name('.rodata')
+        if rodata:
+            data = rodata.data()
+            # 假设 snapshot hash 是32字节ASCII，后面跟着flags字符串
+            m = re.search(rb'([a-f0-9]{32}) ([\w\- ]+)\x00', data)
+            if m:
+                snapshot_hash = m.group(1).decode()
+                flags = m.group(2).decode().strip().split(' ')
+                logger.info("Found snapshot hash and flags via .rodata pattern")
+                return snapshot_hash, flags
+            else:
+                logger.warning("Cannot find snapshot hash and flags pattern in .rodata")
+
+        # 3. 兜底：全文件搜索
+        f.seek(0)
+        all_data = f.read()
+        m = re.search(rb'([a-f0-9]{32}) ([\w\- ]+)\x00', all_data)
+        if m:
+            snapshot_hash = m.group(1).decode()
+            flags = m.group(2).decode().strip().split(' ')
+            logger.info("Found snapshot hash and flags via full file scan")
+            return snapshot_hash, flags
+
+        logger.error("Failed to extract snapshot hash and flags from %s by all methods.", libapp_file)
+        return "", []# 2. fallback to .symtab        
 
 def extract_libflutter_info(libflutter_file):
     with open(libflutter_file, 'rb') as f:
@@ -41,7 +77,7 @@ def extract_libflutter_info(libflutter_file):
         data = section.data()
         
         sha_hashes = re.findall(b'\x00([a-f\\d]{40})(?=\x00)', data)
-        #print(sha_hashes)
+        #logger.debug(sha_hashes)
         # all possible engine ids
         engine_ids = [ h.decode() for h in sha_hashes ]
         assert len(engine_ids) == 2, f'found hashes {", ".join(engine_ids)}'
@@ -87,7 +123,7 @@ def get_dart_commit(url):
             #sig, ver, flags, compression, filetime, filedate, crc, compressSize, uncompressSize, filenameLen, extraLen = unpack(fp, '<IHHHHHIIIHH')
             _, _, _, compMethod, _, _, _, compressSize, _, filenameLen, extraLen = unpack('<IHHHHHIIIHH', fp.read(30))
             filename = fp.read(filenameLen)
-            #print(filename)
+            #logger.debug(filename)
             if extraLen > 0:
                 fp.seek(extraLen, io.SEEK_CUR)
             data = fp.read(compressSize)
@@ -104,22 +140,22 @@ def get_dart_commit(url):
 
 def extract_dart_info(libapp_file: str, libflutter_file: str):
     snapshot_hash, flags = extract_snapshot_hash_flags(libapp_file)
-    #print('snapshot hash', snapshot_hash)
-    #print(flags)
+    logger.debug('snapshot hash', snapshot_hash)
+    logger.debug(flags)
 
     engine_ids, dart_version, arch, os_name = extract_libflutter_info(libflutter_file)
-    # print('possible engine ids', engine_ids)
-    # print('dart version', dart_version)
+    # logger.debug('possible engine ids', engine_ids)
+    # logger.debug('dart version', dart_version)
 
     if dart_version is None:
         engine_id, sdk_url, sdk_size = get_dart_sdk_url_size(engine_ids)
-        # print(engine_id)
-        # print(sdk_url)
-        # print(sdk_size)
+        # logger.debug(engine_id)
+        # logger.debug(sdk_url)
+        # logger.debug(sdk_size)
 
         commit_id, dart_version = get_dart_commit(sdk_url)
-        # print(commit_id)
-        # print(dart_version)
+        # logger.debug(commit_id)
+        # logger.debug(dart_version)
         #assert dart_version == dart_version_sdk
     
     # TODO: os (android or ios) and architecture (arm64 or x64)
@@ -130,5 +166,5 @@ if __name__ == "__main__":
     libdir = sys.argv[1]
     libapp_file = os.path.join(libdir, 'libapp.so')
     libflutter_file = os.path.join(libdir, 'libflutter.so')
-
-    print(extract_dart_info(libapp_file, libflutter_file))
+    logger.success(f"libapp_filepath: {libapp_file}, libflutter_filepath: {libflutter_file}")
+    logger.debug(extract_dart_info(libapp_file, libflutter_file))
